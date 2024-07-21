@@ -35,126 +35,81 @@ class CronJob extends Command
     public function handle()
     {
         $this->info('Cron Job Started');
+
+        $this->handleExpiringOrders();
+        $this->handleUpcomingOrders();
+        $this->handleOrderProductUpgrades();
+        $this->checkExtensionsForUpdates();
+        $this->cleanOldLogs();
+
+        $this->info('Cron Job Finished');
+
+        return Command::SUCCESS;
+    }
+
+    private function handleExpiringOrders()
+    {
         $orders = OrderProduct::where('expiry_date', '<', now())->get();
         foreach ($orders as $order) {
             if ($order->price == 0.00) {
                 continue;
             }
+
             if ($order->status == 'paid' && $order->cancellation()->exists()) {
-                $cancellation = $order->cancellation;
-                $order->status = 'cancelled';
-                $order->save();
-                ExtensionHelper::terminateServer($order);
-                NotificationHelper::sendDeletedOrderNotification($order->order, $order->order->user, $cancellation);
+                $this->cancelOrder($order);
                 continue;
             }
-            if ($order->status == 'paid') {
-                $order->status = 'suspended';
-                $order->save();
-                ExtensionHelper::suspendServer($order);
-                $invoice = $order->getOpenInvoices()->first();
-                // Free products don't have invoices
-                if ($invoice) {
-                    NotificationHelper::sendUnpaidInvoiceNotification($invoice, $order->order->user);
-                }
-                $this->info('Suspended server: ' . $order->id);
-            } elseif ($order->status == 'suspended' || $order->status == 'pending') {
-                if (strtotime($order->expiry_date) < strtotime('-' . config('settings::remove_unpaid_order_after', 7) . ' days')) {
-                    ExtensionHelper::terminateServer($order);
-                    $order->status = 'cancelled';
-                    NotificationHelper::sendDeletedOrderNotification($order->order, $order->order->user);
-                    $order->save();
-                    $invoice = $order->getOpenInvoices()->first();
 
-                    if ($invoice) {
-                        if ($invoice->status !== 'paid') {
-                            $invoice->status = 'cancelled';
-                            $invoice->cancelled_at = now()->format('Y-m-d H:i:s');
-                            $invoice->save();
-                            $this->info('Invoice ' . $invoice->id . ' status changed to ' . $invoice->status);
-                        }
-                    }
-                }
+            if ($order->status == 'paid') {
+                $this->suspendOrder($order);
+            } elseif (in_array($order->status, ['suspended', 'pending'])) {
+                $this->handleSuspendedOrPendingOrder($order);
             }
         }
-        $orders = OrderProduct::where('expiry_date', '<', now()->addDays(7))->where('status', '!=', 'cancelled')->get();
+    }
+
+    private function handleUpcomingOrders()
+    {
+        $orders = OrderProduct::where('expiry_date', '<', now()->addDays(7))
+                              ->where('status', '!=', 'cancelled')
+                              ->get();
+
         $invoiceProcessed = 0;
         foreach ($orders as $order) {
-            if ($order->billing_cycle == 'free' || $order->billing_cycle == 'one-time' || $order->price == 0.00 || $order->cancellation()->exists()) {
+            if (in_array($order->billing_cycle, ['free', 'one-time']) || $order->price == 0.00 || $order->cancellation()->exists()) {
                 continue;
             }
-            // FIXME: Why do we need to call it twice?
-            $order->getOpenInvoices();
 
-            // Get all InvoiceItems for this product
             if ($order->getOpenInvoices()->count() > 0) {
                 continue;
             }
 
-            $invoice = new \App\Models\Invoice();
-            $invoice->order_id = $order->order->id;
-            $invoice->status = 'pending';
-            $invoice->user_id = $order->order->user_id;
-            $invoice->saveQuietly();
-
-            if ($order->billing_cycle == 'monthly') {
-                $date = date('Y-m-d', strtotime('+1 month', strtotime($order->expiry_date)));
-            } elseif ($order->billing_cycle == 'quarterly') {
-                $date = date('Y-m-d', strtotime('+3 month', strtotime($order->expiry_date)));
-            } elseif ($order->billing_cycle == 'semi_annually') {
-                $date = date('Y-m-d', strtotime('+6 month', strtotime($order->expiry_date)));
-            } elseif ($order->billing_cycle == 'annually') {
-                $date = date('Y-m-d', strtotime('+1 year', strtotime($order->expiry_date)));
-            } elseif ($order->billing_cycle == 'biennially') {
-                $date = date('Y-m-d', strtotime('+2 year', strtotime($order->expiry_date)));
-            } elseif ($order->billing_cycle == 'triennially') {
-                $date = date('Y-m-d', strtotime('+3 year', strtotime($order->expiry_date)));
-            } else {
-                $date = date('Y-m-d', strtotime('+1 month', strtotime($order->expiry_date)));
-                $order->billing_cycle = 'monthly';
-                $order->save();
-            }
-            // Add Invoice Items
-            $invoiceItem = new \App\Models\InvoiceItem();
-            $invoiceItem->invoice_id = $invoice->id;
-            $invoiceItem->product_id = $order->id;
-            $description = $order->billing_cycle ? '(' . date('Y-m-d', strtotime($order->expiry_date)) . ' - ' . date('Y-m-d', strtotime($date)) . ')' : '';
-            $invoiceItem->description = $order->product()->get()->first() ? $order->product()->get()->first()->name . ' ' . $description : '' . $description;
-            $invoiceItem->total = $order->price;
-            $invoiceItem->save();
-
-            NotificationHelper::sendNewInvoiceNotification($invoice, $order->order->user);
-
-            event(new \App\Events\Invoice\InvoiceCreated($invoice));
-
-            if ($invoice->total() == 0) {
-                ExtensionHelper::paymentDone($invoice->id);
-                $this->info('Invoice ' . $invoice->id . ' status changed to ' . $invoice->status);
-            }
+            $this->createInvoiceForOrder($order);
             $invoiceProcessed++;
-            $this->info('Sended Invoice: ' . $invoice->id);
         }
-        $this->info('Sended Number of Invoices: ' . $invoiceProcessed);
 
+        $this->info('Sent Number of Invoices: ' . $invoiceProcessed);
+    }
+
+    private function handleOrderProductUpgrades()
+    {
         foreach (OrderProductUpgrade::with('orderProduct')->get() as $orderProductUpgrade) {
             if ($orderProductUpgrade->orderProduct->expiry_date < now()) {
                 $orderProductUpgrade->delete();
             } else {
-                // Update the price
-                $invoiceItem = $orderProductUpgrade->invoice->items->first();
-                $invoiceItem->total = $this->calculateAmount($orderProductUpgrade->product, $orderProductUpgrade->orderProduct);
-                $invoiceItem->save();
-
-                $this->info('Updated Invoice Item: ' . $invoiceItem->id);
+                $this->updateOrderProductUpgrade($orderProductUpgrade);
             }
         }
+    }
 
-        // Check all extensions for updates
+    private function checkExtensionsForUpdates()
+    {
         $extensions = \App\Models\Extension::all();
         foreach ($extensions as $extension) {
             if (!$extension->version) {
                 continue;
             }
+
             $url = config('app.marketplace') . 'extensions?version=' . config('app.version') . '&search=' . $extension->name;
             $response = Http::get($url)->json();
 
@@ -162,20 +117,122 @@ class CronJob extends Command
                 continue;
             }
 
-            $response['data'][0]['versions'] = array_reverse($response['data'][0]['versions']);
-            if (version_compare($extension->version, $response['data'][0]['versions'][0]['version'], '<')) {
-                $extension->update_available = $response['data'][0]['versions'][0]['version'];
+            $latestVersion = $response['data'][0]['versions'][0]['version'];
+            if (version_compare($extension->version, $latestVersion, '<')) {
+                $extension->update_available = $latestVersion;
                 $extension->save();
-                $this->info('Update available for ' . $extension->name . ' to version ' . $response['data'][0]['versions'][0]['version']);
+                $this->info('Update available for ' . $extension->name . ' to version ' . $latestVersion);
             }
         }
+    }
 
-        $this->info('Deleted Logs: ' . Log::where('created_at', '<', now()->subDays(7))->count());
-        Log::where('created_at', '<', now()->subDays(7))->delete();
+    private function cleanOldLogs()
+    {
+        $deletedLogsCount = Log::where('created_at', '<', now()->subDays(7))->delete();
+        $this->info('Deleted Logs: ' . $deletedLogsCount);
+    }
+
+    private function cancelOrder($order)
+    {
+        $cancellation = $order->cancellation;
+        $order->status = 'cancelled';
+        $order->save();
+
+        ExtensionHelper::terminateServer($order);
+        NotificationHelper::sendDeletedOrderNotification($order->order, $order->order->user, $cancellation);
+    }
+
+    private function suspendOrder($order)
+    {
+        $order->status = 'suspended';
+        $order->save();
+
+        ExtensionHelper::suspendServer($order);
+
+        $invoice = $order->getOpenInvoices()->first();
+        if ($invoice) {
+            NotificationHelper::sendUnpaidInvoiceNotification($invoice, $order->order->user);
+        }
+
+        $this->info('Suspended server: ' . $order->id);
+    }
+
+    private function handleSuspendedOrPendingOrder($order)
+    {
+        if (strtotime($order->expiry_date) < strtotime('-' . config('settings::remove_unpaid_order_after', 7) . ' days')) {
+            ExtensionHelper::terminateServer($order);
+            $order->status = 'cancelled';
+            $order->save();
+
+            NotificationHelper::sendDeletedOrderNotification($order->order, $order->order->user);
+
+            $invoice = $order->getOpenInvoices()->first();
+            if ($invoice && $invoice->status !== 'paid') {
+                $invoice->status = 'cancelled';
+                $invoice->cancelled_at = now()->format('Y-m-d H:i:s');
+                $invoice->save();
+                $this->info('Invoice ' . $invoice->id . ' status changed to ' . $invoice->status);
+            }
+        }
+    }
+
+    private function createInvoiceForOrder($order)
+    {
+        $invoice = new Invoice();
+        $invoice->order_id = $order->order->id;
+        $invoice->status = 'pending';
+        $invoice->user_id = $order->order->user_id;
+        $invoice->saveQuietly();
+
+        $date = $this->calculateNextBillingDate($order->expiry_date, $order->billing_cycle);
         
-        $this->info('Cron Job Finished');
+        $invoiceItem = new \App\Models\InvoiceItem();
+        $invoiceItem->invoice_id = $invoice->id;
+        $invoiceItem->product_id = $order->id;
+        $description = $order->product()->get()->first() ? $order->product()->get()->first()->name . ' (' . $order->expiry_date . ' - ' . $date . ')' : '';
+        $invoiceItem->description = $description;
+        $invoiceItem->total = $order->price;
+        $invoiceItem->save();
 
-        return Command::SUCCESS;
+        NotificationHelper::sendNewInvoiceNotification($invoice, $order->order->user);
+
+        event(new \App\Events\Invoice\InvoiceCreated($invoice));
+
+        if ($invoice->total() == 0) {
+            ExtensionHelper::paymentDone($invoice->id);
+            $this->info('Invoice ' . $invoice->id . ' status changed to ' . $invoice->status);
+        }
+
+        $this->info('Sent Invoice: ' . $invoice->id);
+    }
+
+    private function updateOrderProductUpgrade($orderProductUpgrade)
+    {
+        $invoiceItem = $orderProductUpgrade->invoice->items->first();
+        $invoiceItem->total = $this->calculateAmount($orderProductUpgrade->product, $orderProductUpgrade->orderProduct);
+        $invoiceItem->save();
+
+        $this->info('Updated Invoice Item: ' . $invoiceItem->id);
+    }
+
+    private function calculateNextBillingDate($expiry_date, $billing_cycle)
+    {
+        switch ($billing_cycle) {
+            case 'monthly':
+                return date('Y-m-d', strtotime('+1 month', strtotime($expiry_date)));
+            case 'quarterly':
+                return date('Y-m-d', strtotime('+3 months', strtotime($expiry_date)));
+            case 'semi_annually':
+                return date('Y-m-d', strtotime('+6 months', strtotime($expiry_date)));
+            case 'annually':
+                return date('Y-m-d', strtotime('+1 year', strtotime($expiry_date)));
+            case 'biennially':
+                return date('Y-m-d', strtotime('+2 years', strtotime($expiry_date)));
+            case 'triennially':
+                return date('Y-m-d', strtotime('+3 years', strtotime($expiry_date)));
+            default:
+                return date('Y-m-d', strtotime('+1 month', strtotime($expiry_date)));
+        }
     }
 
     private function calculateAmount($product, $orderProduct)
